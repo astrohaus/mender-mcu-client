@@ -118,4 +118,20 @@ menu "Mender advanced Configuration"
         help
             Mender RTOS work queue length, customize only if you have a deep understanding of the impacts! Default value is suitable for most applications.
 
+    config MENDER_CLIENT_WORK_QUEUE_PIN_TO_CORE
+        bool "Pin Mender RTOS Work Queue to specific core (ESP32 SMP)"
+        default n
+        help
+            ESP32 SMP only: pin the RTOS work queue to a specific core.
+
+    if MENDER_CLIENT_WORK_QUEUE_PIN_TO_CORE
+
+        config MENDER_RTOS_WORK_QUEUE_PINNED_CORE
+            int "Mender RTOS Work Queue Pinned Core"
+            range 0 1
+            default 0
+            help
+                Specify which ESP SMP core the work queue should be pinned to.
+
+    endif
 endmenu

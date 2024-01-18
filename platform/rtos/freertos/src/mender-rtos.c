@@ -61,6 +61,13 @@
 #endif /* CONFIG_MENDER_RTOS_WORK_QUEUE_LENGTH */
 
 /**
+ * @brief Default work queue pinned SMP core
+ */
+#ifndef CONFIG_MENDER_RTOS_WORK_QUEUE_PINNED_CORE
+#define CONFIG_MENDER_RTOS_WORK_QUEUE_PINNED_CORE (0)
+#endif /* MENDER_RTOS_WORK_QUEUE_PINNED_CORE */
+
+/**
  * @brief Work context
  */
 typedef struct {
@@ -94,13 +101,24 @@ mender_rtos_init(void) {
         mender_log_error("Unable to create work queue");
         return MENDER_FAIL;
     }
-    if (pdPASS
-        != xTaskCreate(mender_rtos_work_queue_thread,
+
+#ifdef CONFIG_MENDER_CLIENT_WORK_QUEUE_PIN_TO_CORE
+    if (pdPASS != xTaskCreatePinnedToCore(mender_rtos_work_queue_thread,
+                       "mender",
+                       (configSTACK_DEPTH_TYPE)(CONFIG_MENDER_RTOS_WORK_QUEUE_STACK_SIZE * 1024 / sizeof(configSTACK_DEPTH_TYPE)),
+                       NULL,
+                       CONFIG_MENDER_RTOS_WORK_QUEUE_PRIORITY,
+                       NULL,
+                       CONFIG_MENDER_RTOS_WORK_QUEUE_PINNED_CORE)) {
+#else
+    if (pdPASS != xTaskCreate(mender_rtos_work_queue_thread,
                        "mender",
                        (configSTACK_DEPTH_TYPE)(CONFIG_MENDER_RTOS_WORK_QUEUE_STACK_SIZE * 1024 / sizeof(configSTACK_DEPTH_TYPE)),
                        NULL,
                        CONFIG_MENDER_RTOS_WORK_QUEUE_PRIORITY,
                        NULL)) {
+#endif /* MENDER_CLIENT_WORK_QUEUE_PIN_TO_CORE */
+
         mender_log_error("Unable to create work queue thread");
         return MENDER_FAIL;
     }
