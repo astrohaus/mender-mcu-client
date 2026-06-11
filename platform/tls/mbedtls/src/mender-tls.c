@@ -25,16 +25,24 @@
  * SOFTWARE.
  */
 
+#include <mbedtls/build_info.h>
 #include <mbedtls/base64.h>
 #include <mbedtls/bignum.h>
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+/* mbedtls 4 (TF-PSA-Crypto): RNG and RSA key generation go through PSA */
+#include <mbedtls/md.h>
+#include <mbedtls/pk.h>
+#include <psa/crypto.h>
+#else
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
-#ifdef MBEDTLS_ERROR_C
-#include <mbedtls/error.h>
-#endif /* MBEDTLS_ERROR_C */
 #include <mbedtls/pk.h>
 #include <mbedtls/rsa.h>
 #include <mbedtls/x509.h>
+#endif /* MBEDTLS_VERSION_NUMBER >= 0x04000000 */
+#ifdef MBEDTLS_ERROR_C
+#include <mbedtls/error.h>
+#endif /* MBEDTLS_ERROR_C */
 #include "mender-log.h"
 #include "mender-tls.h"
 
@@ -58,9 +66,125 @@
 mender_err_t
 mender_tls_init(void) {
 
-    /* Nothing to do */
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+    if (PSA_SUCCESS != psa_crypto_init()) {
+        mender_log_error("Unable to initialize PSA crypto");
+        return MENDER_FAIL;
+    }
+#endif /* MBEDTLS_VERSION_NUMBER >= 0x04000000 */
     return MENDER_OK;
 }
+
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+
+mender_err_t
+mender_tls_generate_authentication_keys(unsigned char **private_key, size_t *private_key_length, unsigned char **public_key, size_t *public_key_length) {
+
+    assert(NULL != private_key);
+    assert(NULL != private_key_length);
+    assert(NULL != public_key);
+    assert(NULL != public_key_length);
+    int                ret        = -1;
+    psa_key_id_t       key_id     = PSA_KEY_ID_NULL;
+    mbedtls_pk_context pk_context;
+    unsigned char *    tmp;
+#ifdef MBEDTLS_ERROR_C
+    char err[128];
+#endif /* MBEDTLS_ERROR_C */
+
+    *private_key = NULL;
+    *public_key  = NULL;
+    mbedtls_pk_init(&pk_context);
+
+    /* Generate the RSA key pair through PSA (mbedtls 4 removed the legacy
+     * RSA keygen API). The exported key is PKCS#1 RSAPrivateKey DER - the
+     * same format mbedtls_pk_write_key_der produced before, so previously
+     * provisioned devices and the server contract are unaffected. */
+    {
+        psa_key_attributes_t attributes = PSA_KEY_ATTRIBUTES_INIT;
+        psa_set_key_type(&attributes, PSA_KEY_TYPE_RSA_KEY_PAIR);
+        psa_set_key_bits(&attributes, 3072);
+        psa_set_key_usage_flags(&attributes, PSA_KEY_USAGE_EXPORT | PSA_KEY_USAGE_SIGN_HASH);
+        psa_set_key_algorithm(&attributes, PSA_ALG_RSA_PKCS1V15_SIGN(PSA_ALG_SHA_256));
+
+        psa_status_t status = psa_generate_key(&attributes, &key_id);
+        psa_reset_key_attributes(&attributes);
+        if (PSA_SUCCESS != status) {
+            mender_log_error("Unable to generate key pair (PSA status %d)", (int)status);
+            goto END;
+        }
+    }
+
+    /* Export private key (PKCS#1 DER) */
+    if (NULL == (*private_key = (unsigned char *)malloc(MENDER_TLS_PRIVATE_KEY_LENGTH))) {
+        mender_log_error("Unable to allocate memory");
+        goto END;
+    }
+    if (PSA_SUCCESS != psa_export_key(key_id, *private_key, MENDER_TLS_PRIVATE_KEY_LENGTH, private_key_length)) {
+        mender_log_error("Unable to export private key");
+        goto END;
+    }
+    if (NULL == (tmp = realloc(*private_key, *private_key_length))) {
+        mender_log_error("Unable to allocate memory");
+        goto END;
+    }
+    *private_key = tmp;
+
+    /* Derive the SubjectPublicKeyInfo DER the server expects via the pk
+     * layer (PSA exports raw RSAPublicKey, which is a different encoding) */
+    if (0 != (ret = mbedtls_pk_parse_key(&pk_context, *private_key, *private_key_length, NULL, 0))) {
+#ifdef MBEDTLS_ERROR_C
+        mbedtls_strerror(ret, err, sizeof(err));
+        mender_log_error("Unable to parse generated key (-0x%04x: %s)", -ret, err);
+#else
+        mender_log_error("Unable to parse generated key (-0x%04x)", -ret);
+#endif /* MBEDTLS_ERROR_C */
+        goto END;
+    }
+    if (NULL == (*public_key = (unsigned char *)malloc(MENDER_TLS_PUBLIC_KEY_LENGTH))) {
+        mender_log_error("Unable to allocate memory");
+        goto END;
+    }
+    if ((ret = mbedtls_pk_write_pubkey_der(&pk_context, *public_key, MENDER_TLS_PUBLIC_KEY_LENGTH)) < 0) {
+#ifdef MBEDTLS_ERROR_C
+        mbedtls_strerror(ret, err, sizeof(err));
+        mender_log_error("Unable to write public key (-0x%04x: %s)", -ret, err);
+#else
+        mender_log_error("Unable to write public key (-0x%04x)", -ret);
+#endif /* MBEDTLS_ERROR_C */
+        goto END;
+    }
+    *public_key_length = (size_t)ret;
+    /* write_pubkey_der writes at the end of the buffer */
+    memcpy(*public_key, *public_key + MENDER_TLS_PUBLIC_KEY_LENGTH - *public_key_length, *public_key_length);
+    if (NULL == (tmp = realloc(*public_key, *public_key_length))) {
+        mender_log_error("Unable to allocate memory");
+        goto END;
+    }
+    *public_key = tmp;
+    ret         = 0;
+
+END:
+
+    if (PSA_KEY_ID_NULL != key_id) {
+        psa_destroy_key(key_id);
+    }
+    mbedtls_pk_free(&pk_context);
+    if (0 != ret) {
+        if (NULL != *private_key) {
+            free(*private_key);
+            *private_key = NULL;
+        }
+        if (NULL != *public_key) {
+            free(*public_key);
+            *public_key = NULL;
+        }
+    }
+
+    return (0 != ret) ? MENDER_FAIL : MENDER_OK;
+}
+
+#else /* MBEDTLS_VERSION_NUMBER < 0x04000000 */
 
 mender_err_t
 mender_tls_generate_authentication_keys(unsigned char **private_key, size_t *private_key_length, unsigned char **public_key, size_t *public_key_length) {
@@ -214,6 +338,8 @@ END:
     return (0 != ret) ? MENDER_FAIL : MENDER_OK;
 }
 
+#endif /* MBEDTLS_VERSION_NUMBER >= 0x04000000 */
+
 mender_err_t
 mender_tls_pem_write_buffer(const unsigned char *der_data, size_t der_len, char *buf, size_t buf_len, size_t *olen) {
 
@@ -302,8 +428,10 @@ mender_tls_sign_payload(unsigned char *private_key, size_t private_key_length, c
     assert(NULL != signature_length);
     int                       ret;
     mbedtls_pk_context *      pk_context = NULL;
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
     mbedtls_ctr_drbg_context *ctr_drbg   = NULL;
     mbedtls_entropy_context * entropy    = NULL;
+#endif /* MBEDTLS_VERSION_NUMBER < 0x04000000 */
     unsigned char *           sig        = NULL;
     size_t                    sig_length;
     char *                    tmp;
@@ -318,6 +446,7 @@ mender_tls_sign_payload(unsigned char *private_key, size_t private_key_length, c
         goto END;
     }
     mbedtls_pk_init(pk_context);
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
     if (NULL == (ctr_drbg = (mbedtls_ctr_drbg_context *)malloc(sizeof(mbedtls_ctr_drbg_context)))) {
         mender_log_error("Unable to allocate memory");
         ret = -1;
@@ -341,13 +470,17 @@ mender_tls_sign_payload(unsigned char *private_key, size_t private_key_length, c
 #endif /* MBEDTLS_ERROR_C */
         goto END;
     }
+#endif /* MBEDTLS_VERSION_NUMBER < 0x04000000 */
 
     /* Parse private key (IMPORTANT NOTE: length must include the ending \0 character) */
-#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+    /* mbedtls 4: randomness comes from PSA, no RNG arguments */
+    if (0 != (ret = mbedtls_pk_parse_key(pk_context, private_key, private_key_length, NULL, 0))) {
+#elif MBEDTLS_VERSION_NUMBER >= 0x03000000
     if (0 != (ret = mbedtls_pk_parse_key(pk_context, private_key, private_key_length, NULL, 0, mbedtls_ctr_drbg_random, ctr_drbg))) {
 #else
     if (0 != (ret = mbedtls_pk_parse_key(pk_context, private_key, private_key_length, NULL, 0))) {
-#endif /* MBEDTLS_VERSION_NUMBER >= 0x03000000 */
+#endif /* MBEDTLS_VERSION_NUMBER */
 #ifdef MBEDTLS_ERROR_C
         mbedtls_strerror(ret, err, sizeof(err));
         mender_log_error("Unable to parse private key (-0x%04x: %s)", -ret, err);
@@ -376,11 +509,13 @@ mender_tls_sign_payload(unsigned char *private_key, size_t private_key_length, c
         goto END;
     }
     sig_length = MENDER_TLS_SIGNATURE_LENGTH + 1;
-#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+#if MBEDTLS_VERSION_NUMBER >= 0x04000000
+    if (0 != (ret = mbedtls_pk_sign(pk_context, MBEDTLS_MD_SHA256, digest, sizeof(digest), sig, sig_length, &sig_length))) {
+#elif MBEDTLS_VERSION_NUMBER >= 0x03000000
     if (0 != (ret = mbedtls_pk_sign(pk_context, MBEDTLS_MD_SHA256, digest, sizeof(digest), sig, sig_length, &sig_length, mbedtls_ctr_drbg_random, ctr_drbg))) {
 #else
     if (0 != (ret = mbedtls_pk_sign(pk_context, MBEDTLS_MD_SHA256, digest, sizeof(digest), sig, &sig_length, mbedtls_ctr_drbg_random, ctr_drbg))) {
-#endif /* MBEDTLS_VERSION_NUMBER >= 0x03000000 */
+#endif /* MBEDTLS_VERSION_NUMBER */
 #ifdef MBEDTLS_ERROR_C
         mbedtls_strerror(ret, err, sizeof(err));
         mender_log_error("Unable to compute signature (-0x%04x: %s)", -ret, err);
@@ -421,6 +556,7 @@ mender_tls_sign_payload(unsigned char *private_key, size_t private_key_length, c
 END:
 
     /* Release mbedtls */
+#if MBEDTLS_VERSION_NUMBER < 0x04000000
     if (NULL != entropy) {
         mbedtls_entropy_free(entropy);
         free(entropy);
@@ -429,6 +565,7 @@ END:
         mbedtls_ctr_drbg_free(ctr_drbg);
         free(ctr_drbg);
     }
+#endif /* MBEDTLS_VERSION_NUMBER < 0x04000000 */
     if (NULL != pk_context) {
         mbedtls_pk_free(pk_context);
         free(pk_context);
