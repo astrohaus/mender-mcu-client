@@ -28,8 +28,21 @@
 #include <errno.h>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include "mender-http.h"
 #include "mender-log.h"
+
+/* FW-306: device-wide TLS-handshake gate (main/modules/net/tls_gate.c).
+ * Declared extern rather than included — a component cannot include main/
+ * headers. Mender's handshake overlapping the doorbell WSS or a Postbox
+ * HTTPS handshake bottomed internal min-free at 43 bytes on the bench; the
+ * gate is held across esp_http_client_open() only (the handshake window),
+ * never the download that follows, so an OTA transfer cannot starve the
+ * other clients. */
+extern bool tls_gate_acquire(uint32_t timeout_ms);
+extern void tls_gate_release(void);
+#define MENDER_TLS_GATE_TIMEOUT_MS (20000)
 
 /**
  * @brief Mender HTTP configuration
@@ -110,8 +123,16 @@ mender_http_perform(char *               jwt,
         esp_http_client_set_header(client, "Content-Type", "application/json");
     }
 
-    /* Open HTTP client connection */
-    if (ESP_OK != (err = esp_http_client_open(client, (NULL != payload) ? (int)strlen(payload) : 0))) {
+    /* Open HTTP client connection. FW-306: hold the device-wide gate across
+     * the open (= the TLS handshake), releasing before the body transfer. */
+    {
+        bool tls_held = tls_gate_acquire(MENDER_TLS_GATE_TIMEOUT_MS);
+        err            = esp_http_client_open(client, (NULL != payload) ? (int)strlen(payload) : 0);
+        if (tls_held) {
+            tls_gate_release();
+        }
+    }
+    if (ESP_OK != err) {
         mender_log_error("Unable to open HTTP client connection: %s", esp_err_to_name(err));
         ret = MENDER_FAIL;
         goto END;
