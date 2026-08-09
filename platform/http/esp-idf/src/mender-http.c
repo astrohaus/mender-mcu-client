@@ -33,13 +33,17 @@
 #include "mender-http.h"
 #include "mender-log.h"
 
-/* FW-306: device-wide TLS-handshake gate (main/modules/net/tls_gate.c).
- * Declared extern rather than included — a component cannot include main/
- * headers. Mender's handshake overlapping the doorbell WSS or a Postbox
- * HTTPS handshake bottomed internal min-free at 43 bytes on the bench; the
- * gate is held across esp_http_client_open() only (the handshake window),
- * never the download that follows, so an OTA transfer cannot starve the
- * other clients. */
+/* FW-306/FW-318: device-wide TLS connection-attempt gate
+ * (main/modules/net/tls_gate.c). Declared extern rather than included — a
+ * component cannot include main/ headers. Mender's handshake overlapping the
+ * doorbell WSS or a Postbox HTTPS handshake bottomed internal min-free at 43
+ * bytes on the bench (FW-306); the boot-window first attempt then died at
+ * ~8KB free with the open-only hold, because the client's own rx/tx buffers
+ * (internal RAM) were allocated OUTSIDE the gate (FW-318). The gate is now
+ * held across the whole connection attempt — esp_http_client_init (buffer
+ * allocation) through esp_http_client_open (socket + TLS handshake) — and
+ * released before the body transfer, so an OTA download still cannot starve
+ * the other clients. */
 extern bool tls_gate_acquire(uint32_t timeout_ms);
 extern void tls_gate_release(void);
 #define MENDER_TLS_GATE_TIMEOUT_MS (20000)
@@ -83,9 +87,10 @@ mender_http_perform(char *               jwt,
     assert(NULL != status);
     esp_err_t                err;
     mender_err_t             ret;
-    esp_http_client_handle_t client = NULL;
-    char *                   url    = NULL;
-    char *                   bearer = NULL;
+    esp_http_client_handle_t client   = NULL;
+    char *                   url      = NULL;
+    char *                   bearer   = NULL;
+    bool                     tls_held = false;
 
     /* Compute URL if required */
     if (strncmp(path, "http", strlen("http"))) {
@@ -99,6 +104,12 @@ mender_http_perform(char *               jwt,
 
     /* Configuration of the client */
     esp_http_client_config_t config = { .url = (NULL != url) ? url : path, .crt_bundle_attach = esp_crt_bundle_attach, .buffer_size_tx = 2048 };
+
+    /* FW-318: the connection attempt starts HERE — the client's rx/tx
+     * buffers are internal-RAM allocations that belong to the attempt just
+     * as much as the socket and handshake do. Acquire before init, release
+     * after open. Failure paths in between exit via END, which releases. */
+    tls_held = tls_gate_acquire(MENDER_TLS_GATE_TIMEOUT_MS);
 
     /* Initialization of the client */
     if (NULL == (client = esp_http_client_init(&config))) {
@@ -123,14 +134,13 @@ mender_http_perform(char *               jwt,
         esp_http_client_set_header(client, "Content-Type", "application/json");
     }
 
-    /* Open HTTP client connection. FW-306: hold the device-wide gate across
-     * the open (= the TLS handshake), releasing before the body transfer. */
-    {
-        bool tls_held = tls_gate_acquire(MENDER_TLS_GATE_TIMEOUT_MS);
-        err            = esp_http_client_open(client, (NULL != payload) ? (int)strlen(payload) : 0);
-        if (tls_held) {
-            tls_gate_release();
-        }
+    /* Open HTTP client connection (DNS + socket + TLS handshake), then end
+     * the gated window: everything past here is transfer, which must never
+     * hold the device-wide gate. */
+    err = esp_http_client_open(client, (NULL != payload) ? (int)strlen(payload) : 0);
+    if (tls_held) {
+        tls_gate_release();
+        tls_held = false;
     }
     if (ESP_OK != err) {
         mender_log_error("Unable to open HTTP client connection: %s", esp_err_to_name(err));
@@ -187,6 +197,13 @@ mender_http_perform(char *               jwt,
     }
 
 END:
+
+    /* A failure between the gate acquire and the post-open release (client
+     * init or bearer allocation) lands here still holding — a leaked hold
+     * would starve every TLS connection attempt on the device. */
+    if (tls_held) {
+        tls_gate_release();
+    }
 
     /* Release memory */
     if (NULL != client) {
