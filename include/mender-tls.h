@@ -82,6 +82,18 @@ mender_err_t mender_tls_sign_payload(unsigned char *private_key, size_t private_
  */
 mender_err_t mender_tls_exit(void);
 
+/**
+ * @brief Crypto-section hooks (FW-397). RSA-3072 key generation and payload
+ * signing run long stretches of pure-software bignum; on a DVFS-governed SoC
+ * sitting at its idle floor frequency a single pass can starve the idle task
+ * past the task watchdog. The mbedtls platform implementation brackets those
+ * regions with these hooks; the integrator may override them (they are weak)
+ * to pin the CPU at full clock for the duration (e.g. an esp_pm CPU_FREQ_MAX
+ * lock). Defaults are no-ops.
+ */
+void mender_tls_crypto_section_enter(void);
+void mender_tls_crypto_section_exit(void);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

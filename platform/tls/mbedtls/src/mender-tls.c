@@ -63,6 +63,15 @@
 #define MENDER_TLS_SIGNATURE_LENGTH (512)
 #endif /* MENDER_TLS_SIGNATURE_LENGTH */
 
+/* Crypto-section hooks (FW-397) — see mender-tls.h. Weak no-op defaults; the
+ * integrator overrides them to pin the CPU at full clock. */
+__attribute__((weak)) void
+mender_tls_crypto_section_enter(void) {
+}
+__attribute__((weak)) void
+mender_tls_crypto_section_exit(void) {
+}
+
 mender_err_t
 mender_tls_init(void) {
 
@@ -95,6 +104,7 @@ mender_tls_generate_authentication_keys(unsigned char **private_key, size_t *pri
     *private_key = NULL;
     *public_key  = NULL;
     mbedtls_pk_init(&pk_context);
+    mender_tls_crypto_section_enter();
 
     /* Generate the RSA key pair through PSA (mbedtls 4 removed the legacy
      * RSA keygen API). The exported key is PKCS#1 RSAPrivateKey DER - the
@@ -181,6 +191,7 @@ END:
         }
     }
 
+    mender_tls_crypto_section_exit();
     return (0 != ret) ? MENDER_FAIL : MENDER_OK;
 }
 
@@ -198,6 +209,7 @@ mender_tls_generate_authentication_keys(unsigned char **private_key, size_t *pri
     mbedtls_ctr_drbg_context *ctr_drbg   = NULL;
     mbedtls_entropy_context * entropy    = NULL;
     unsigned char *           tmp;
+    mender_tls_crypto_section_enter();
 
 #ifdef MBEDTLS_ERROR_C
     char err[128];
@@ -335,6 +347,7 @@ END:
         free(pk_context);
     }
 
+    mender_tls_crypto_section_exit();
     return (0 != ret) ? MENDER_FAIL : MENDER_OK;
 }
 
@@ -438,6 +451,8 @@ mender_tls_sign_payload(unsigned char *private_key, size_t private_key_length, c
 #ifdef MBEDTLS_ERROR_C
     char err[128];
 #endif /* MBEDTLS_ERROR_C */
+
+    mender_tls_crypto_section_enter();
 
     /* Initialize mbedtls */
     if (NULL == (pk_context = (mbedtls_pk_context *)malloc(sizeof(mbedtls_pk_context)))) {
@@ -576,6 +591,7 @@ END:
         free(sig);
     }
 
+    mender_tls_crypto_section_exit();
     return (0 != ret) ? MENDER_FAIL : MENDER_OK;
 }
 
