@@ -431,6 +431,12 @@ REBOOT:
     return MENDER_DONE;
 }
 
+/* Deployment-check hook — see mender-client.h. Weak no-op default. */
+__attribute__((weak)) void
+mender_client_deployment_check_done(bool ok) {
+    (void)ok;
+}
+
 static mender_err_t
 mender_client_update_work_function(void) {
 
@@ -443,12 +449,14 @@ mender_client_update_work_function(void) {
     mender_log_info("Checking for deployment...");
     if (MENDER_OK != (ret = mender_api_check_for_deployment(&id, &artifact_name, &uri))) {
         mender_log_error("Unable to check for deployment");
+        mender_client_deployment_check_done(false);
         goto END;
     }
 
     /* Check if deployment is available */
     if ((NULL == id) || (NULL == artifact_name) || (NULL == uri)) {
         mender_log_info("No deployment available");
+        mender_client_deployment_check_done(true);
         goto END;
     }
 
@@ -456,6 +464,7 @@ mender_client_update_work_function(void) {
     if (!strcmp(artifact_name, mender_client_config.artifact_name)) {
         mender_log_error("Artifact is already installed");
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_ALREADY_INSTALLED);
+        mender_client_deployment_check_done(true);
         goto END;
     }
 

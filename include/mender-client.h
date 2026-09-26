@@ -78,6 +78,18 @@ mender_err_t mender_client_init(mender_client_config_t *config, mender_client_ca
  */
 mender_err_t mender_client_exit(void);
 
+/**
+ * @brief Deployment-check hook. Called once per deployment check with its
+ * outcome: ok=false when the check itself failed (network, server, parse),
+ * ok=true when the server answered and there is nothing to install (no
+ * deployment, or the deployment names the artifact already running). An
+ * available deployment is reported through the deployment_available
+ * callback instead. Weak no-op default; the integrator overrides it to tell
+ * "the server said no update" apart from "the question never got an answer".
+ * @param ok Whether the server answered the check
+ */
+void mender_client_deployment_check_done(bool ok);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
