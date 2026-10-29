@@ -49,6 +49,12 @@ extern void tls_gate_release(void);
 #define MENDER_TLS_GATE_TIMEOUT_MS (20000)
 
 /**
+ * @brief Read timeouts in a row a transfer survives (each is the client's
+ * timeout, 5 s by default) before it ends as a failure
+ */
+#define MENDER_HTTP_READ_STALLS_MAX (6)
+
+/**
  * @brief Mender HTTP configuration
  */
 static mender_http_config_t mender_http_config;
@@ -168,24 +174,33 @@ mender_http_perform(char *               jwt,
         goto END;
     }
 
-    /* Read data until all have been received */
+    /* Read data until all have been received. A read that brings nothing is
+     * the transport waiting out its timeout (-ESP_ERR_HTTP_EAGAIN, tried again
+     * a few times) or a connection that ended before the body did: a server
+     * that closed mid-body made every later read return at once, and the
+     * loop spun core 0 until the watchdog fired */
+    int stalls = 0;
     while (false == esp_http_client_is_complete_data_received(client)) {
         char data[512];
-        int  read_length = esp_http_client_read_response(client, data, sizeof(data));
+        int  read_length = esp_http_client_read(client, data, sizeof(data));
 
         if (read_length > 0) {
+            stalls = 0;
             /* Transmit data received to the upper layer */
             if (MENDER_OK != (ret = callback(MENDER_HTTP_EVENT_DATA_RECEIVED, data, (size_t)read_length, params))) {
                 mender_log_error("An error occurred, stop reading data");
                 goto END;
             }
+        } else if (esp_http_client_is_complete_data_received(client)) {
+            /* The last read held only the end of a chunked body */
+            break;
+        } else if ((-ESP_ERR_HTTP_EAGAIN == read_length) && (++stalls < MENDER_HTTP_READ_STALLS_MAX)) {
+            continue;
         } else {
-            if ((ECONNRESET == errno) || (ENOTCONN == errno)) {
-                mender_log_error("An error occurred, connection has been closed, errno = %d", errno);
-                callback(MENDER_HTTP_EVENT_ERROR, NULL, 0, params);
-                ret = MENDER_FAIL;
-                goto END;
-            }
+            mender_log_error("An error occurred, connection has been closed, read = %d, errno = %d", read_length, errno);
+            callback(MENDER_HTTP_EVENT_ERROR, NULL, 0, params);
+            ret = MENDER_FAIL;
+            goto END;
         }
     }
 

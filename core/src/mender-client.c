@@ -261,6 +261,13 @@ mender_client_exit(void) {
     mender_rtos_work_delete(mender_client_update_work_handle);
     mender_client_update_work_handle = NULL;
 
+    /* An OTA handle left by a download the exit cut short belongs to that
+     * transfer: abort it here, never in the next client */
+    if (NULL != mender_client_ota_handle) {
+        mender_client_callbacks.ota_abort(mender_client_ota_handle);
+        mender_client_ota_handle = NULL;
+    }
+
     /* Release all modules */
     mender_api_exit();
     mender_tls_exit();
@@ -411,10 +418,19 @@ mender_client_authentication_work_function(void) {
          * update with the new artifact name (Freewrite Alpha AA23480904,
          * 2026-10-29). A refusal (an aborted or deleted deployment) is an
          * answer too, so a dead deployment never holds the update checks. */
-        ret = mender_client_publish_deployment_status(mender_client_ota_id, outcome);
+        ret = mender_api_publish_deployment_status(mender_client_ota_id, outcome);
         if ((MENDER_OK != ret) && (MENDER_REFUSED != ret)) {
             mender_log_error("Unable to report the deployment outcome, keeping it for the next authentication");
+            /* No update check runs this round: say so now, rather than leave
+             * a waiting check to its deadline */
+            mender_client_deployment_check_done(false);
             return ret;
+        }
+
+        /* The app hears the outcome once, when the server has answered, not
+         * at every attempt */
+        if (NULL != mender_client_callbacks.deployment_status) {
+            mender_client_callbacks.deployment_status(outcome, mender_utils_deployment_status_to_string(outcome));
         }
 
         /* Delete pending OTA */
@@ -495,29 +511,33 @@ mender_client_update_work_function(void) {
         mender_log_error("Unable to download artifact");
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
         mender_client_callbacks.ota_abort(mender_client_ota_handle);
+        mender_client_ota_handle = NULL;
         goto END;
     }
 
     /* Save OTA ID to publish deployment status after rebooting, before the
-     * boot partition changes: a record that can't be saved leaves the device
-     * on the image it runs, instead of booting a new one the server was told
-     * had failed */
+     * boot partition changes, so a power cut between the two leaves the old
+     * image with a record that reports the failure. A record that can't be
+     * saved (settings storage full) doesn't stop the install: the device
+     * boots the new image unreported and the server marks the deployment
+     * failed at its next check, but the writer has the update */
     mender_log_info("Download done, installing artifact");
     mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_INSTALLING);
-    if (MENDER_OK != (ret = mender_storage_set_ota_deployment(id, artifact_name))) {
-        mender_log_error("Unable to save OTA ID");
-        mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
-        mender_client_callbacks.ota_abort(mender_client_ota_handle);
-        goto END;
+    if (MENDER_OK != mender_storage_set_ota_deployment(id, artifact_name)) {
+        mender_log_error("Unable to save OTA ID, installing without it");
+        mender_storage_delete_ota_deployment();
     }
 
-    /* Set boot partition */
+    /* Set boot partition, which releases the handle when it succeeds */
     if (MENDER_OK != (ret = mender_client_callbacks.ota_set_boot_partition(mender_client_ota_handle))) {
         mender_log_error("Unable to set boot partition");
+        mender_client_callbacks.ota_abort(mender_client_ota_handle);
+        mender_client_ota_handle = NULL;
         mender_storage_delete_ota_deployment();
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
         goto END;
     }
+    mender_client_ota_handle = NULL;
 
     /* Now need to reboot to apply the update */
     mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_REBOOTING);

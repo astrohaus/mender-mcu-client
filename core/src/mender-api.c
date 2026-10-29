@@ -350,13 +350,15 @@ mender_api_publish_deployment_status(char *id, mender_deployment_status_t deploy
 
     /* Treatment depending of the status: an answer other than 204 is the
      * server's refusal (an aborted or deleted deployment), which the caller
-     * tells apart from no answer at all (MENDER_FAIL above) */
+     * tells apart from no answer at all (MENDER_FAIL above). A 5xx, 408 or 429
+     * is the gateway or a service that couldn't take the request now (the
+     * deployments service restarting while sign-in works): no answer either */
     if (204 == status) {
         /* No response expected */
         ret = MENDER_OK;
     } else {
         mender_api_print_response_error(response, status);
-        ret = MENDER_REFUSED;
+        ret = ((status >= 500) || (408 == status) || (429 == status)) ? MENDER_FAIL : MENDER_REFUSED;
     }
 
 END:
