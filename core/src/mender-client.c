@@ -396,21 +396,33 @@ mender_client_authentication_work_function(void) {
     if ((NULL != mender_client_ota_id) && (NULL != mender_client_ota_artifact_name)) {
 
         /* Check if artifact running is the pending one or if the configuration deployed is the expected one, fails if rollback occurred */
+        mender_deployment_status_t outcome = MENDER_DEPLOYMENT_STATUS_FAILURE;
         if ((!strcmp(mender_client_ota_artifact_name, mender_client_config.artifact_name))
             || ((mender_utils_strbeginwith(mender_client_ota_artifact_name, "configuration"))
                 && (!strcmp(mender_client_ota_artifact_name + strlen("configuration") + 1, mender_client_ota_id)))) {
+            outcome = MENDER_DEPLOYMENT_STATUS_SUCCESS;
+        }
 
-            /* Publish deployment status success */
-            mender_client_publish_deployment_status(mender_client_ota_id, MENDER_DEPLOYMENT_STATUS_SUCCESS);
-
-        } else {
-
-            /* Publish deployment status failure */
-            mender_client_publish_deployment_status(mender_client_ota_id, MENDER_DEPLOYMENT_STATUS_FAILURE);
+        /* The pending OTA goes only once the server has answered. A report
+         * that never arrived (the connection dropped after the login) is made
+         * again at the next authentication, by this client or the next one,
+         * which reads the record again; until then no update check runs, as
+         * the server fails an open deployment whose device asks for its next
+         * update with the new artifact name (Freewrite Alpha AA23480904,
+         * 2026-10-29). A refusal (an aborted or deleted deployment) is an
+         * answer too, so a dead deployment never holds the update checks. */
+        ret = mender_client_publish_deployment_status(mender_client_ota_id, outcome);
+        if ((MENDER_OK != ret) && (MENDER_REFUSED != ret)) {
+            mender_log_error("Unable to report the deployment outcome, keeping it for the next authentication");
+            return ret;
         }
 
         /* Delete pending OTA */
         mender_storage_delete_ota_deployment();
+        free(mender_client_ota_id);
+        mender_client_ota_id = NULL;
+        free(mender_client_ota_artifact_name);
+        mender_client_ota_artifact_name = NULL;
     }
 
     /* Activate update work */
@@ -486,18 +498,23 @@ mender_client_update_work_function(void) {
         goto END;
     }
 
-    /* Set boot partition */
+    /* Save OTA ID to publish deployment status after rebooting, before the
+     * boot partition changes: a record that can't be saved leaves the device
+     * on the image it runs, instead of booting a new one the server was told
+     * had failed */
     mender_log_info("Download done, installing artifact");
     mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_INSTALLING);
-    if (MENDER_OK != (ret = mender_client_callbacks.ota_set_boot_partition(mender_client_ota_handle))) {
-        mender_log_error("Unable to set boot partition");
+    if (MENDER_OK != (ret = mender_storage_set_ota_deployment(id, artifact_name))) {
+        mender_log_error("Unable to save OTA ID");
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
+        mender_client_callbacks.ota_abort(mender_client_ota_handle);
         goto END;
     }
 
-    /* Save OTA ID to publish deployment status after rebooting */
-    if (MENDER_OK != (ret = mender_storage_set_ota_deployment(id, artifact_name))) {
-        mender_log_error("Unable to save OTA ID");
+    /* Set boot partition */
+    if (MENDER_OK != (ret = mender_client_callbacks.ota_set_boot_partition(mender_client_ota_handle))) {
+        mender_log_error("Unable to set boot partition");
+        mender_storage_delete_ota_deployment();
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
         goto END;
     }

@@ -348,13 +348,15 @@ mender_api_publish_deployment_status(char *id, mender_deployment_status_t deploy
         goto END;
     }
 
-    /* Treatment depending of the status */
+    /* Treatment depending of the status: an answer other than 204 is the
+     * server's refusal (an aborted or deleted deployment), which the caller
+     * tells apart from no answer at all (MENDER_FAIL above) */
     if (204 == status) {
         /* No response expected */
         ret = MENDER_OK;
     } else {
         mender_api_print_response_error(response, status);
-        ret = MENDER_FAIL;
+        ret = MENDER_REFUSED;
     }
 
 END:

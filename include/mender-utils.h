@@ -49,6 +49,7 @@ typedef enum {
     MENDER_OK        = 0,  /**< OK */
     MENDER_FAIL      = -1, /**< Failure */
     MENDER_NOT_FOUND = -2, /**< Not found */
+    MENDER_REFUSED   = -3, /**< The server answered, and refused the request */
 } mender_err_t;
 
 /**
