@@ -75,7 +75,8 @@ mender_err_t mender_api_check_for_deployment(char **id, char **artifact_name, ch
  * @brief Publish deployment status of the device to the mender-server
  * @param id ID of the deployment received from mender_api_check_for_deployment function
  * @param deployment_status Deployment status
- * @return MENDER_OK if the function succeeds, error code otherwise
+ * @return MENDER_OK if the server took the status, MENDER_REFUSED if it answered and refused it (an aborted or deleted
+ * deployment), MENDER_FAIL if no answer came (no connection, a timeout, or a 5xx, 408 or 429)
  */
 mender_err_t mender_api_publish_deployment_status(char *id, mender_deployment_status_t deployment_status);
 

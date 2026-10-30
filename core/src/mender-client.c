@@ -261,6 +261,13 @@ mender_client_exit(void) {
     mender_rtos_work_delete(mender_client_update_work_handle);
     mender_client_update_work_handle = NULL;
 
+    /* An OTA handle left by a download the exit cut short belongs to that
+     * transfer: abort it here, never in the next client */
+    if (NULL != mender_client_ota_handle) {
+        mender_client_callbacks.ota_abort(mender_client_ota_handle);
+        mender_client_ota_handle = NULL;
+    }
+
     /* Release all modules */
     mender_api_exit();
     mender_tls_exit();
@@ -396,21 +403,42 @@ mender_client_authentication_work_function(void) {
     if ((NULL != mender_client_ota_id) && (NULL != mender_client_ota_artifact_name)) {
 
         /* Check if artifact running is the pending one or if the configuration deployed is the expected one, fails if rollback occurred */
+        mender_deployment_status_t outcome = MENDER_DEPLOYMENT_STATUS_FAILURE;
         if ((!strcmp(mender_client_ota_artifact_name, mender_client_config.artifact_name))
             || ((mender_utils_strbeginwith(mender_client_ota_artifact_name, "configuration"))
                 && (!strcmp(mender_client_ota_artifact_name + strlen("configuration") + 1, mender_client_ota_id)))) {
+            outcome = MENDER_DEPLOYMENT_STATUS_SUCCESS;
+        }
 
-            /* Publish deployment status success */
-            mender_client_publish_deployment_status(mender_client_ota_id, MENDER_DEPLOYMENT_STATUS_SUCCESS);
+        /* The pending OTA goes only once the server has answered. A report
+         * that never arrived (the connection dropped after the login) is made
+         * again at the next authentication, by this client or the next one,
+         * which reads the record again; until then no update check runs, as
+         * the server fails an open deployment whose device asks for its next
+         * update with the new artifact name (Freewrite Alpha AA23480904,
+         * 2026-10-29). A refusal (an aborted or deleted deployment) is an
+         * answer too, so a dead deployment never holds the update checks. */
+        ret = mender_api_publish_deployment_status(mender_client_ota_id, outcome);
+        if ((MENDER_OK != ret) && (MENDER_REFUSED != ret)) {
+            mender_log_error("Unable to report the deployment outcome, keeping it for the next authentication");
+            /* No update check runs this round: say so now, rather than leave
+             * a waiting check to its deadline */
+            mender_client_deployment_check_done(false);
+            return ret;
+        }
 
-        } else {
-
-            /* Publish deployment status failure */
-            mender_client_publish_deployment_status(mender_client_ota_id, MENDER_DEPLOYMENT_STATUS_FAILURE);
+        /* The app hears the outcome once, when the server has answered, not
+         * at every attempt */
+        if (NULL != mender_client_callbacks.deployment_status) {
+            mender_client_callbacks.deployment_status(outcome, mender_utils_deployment_status_to_string(outcome));
         }
 
         /* Delete pending OTA */
         mender_storage_delete_ota_deployment();
+        free(mender_client_ota_id);
+        mender_client_ota_id = NULL;
+        free(mender_client_ota_artifact_name);
+        mender_client_ota_artifact_name = NULL;
     }
 
     /* Activate update work */
@@ -483,24 +511,33 @@ mender_client_update_work_function(void) {
         mender_log_error("Unable to download artifact");
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
         mender_client_callbacks.ota_abort(mender_client_ota_handle);
+        mender_client_ota_handle = NULL;
         goto END;
     }
 
-    /* Set boot partition */
+    /* Save OTA ID to publish deployment status after rebooting, before the
+     * boot partition changes, so a power cut between the two leaves the old
+     * image with a record that reports the failure. A record that can't be
+     * saved (settings storage full) doesn't stop the install: the device
+     * boots the new image unreported and the server marks the deployment
+     * failed at its next check, but the writer has the update */
     mender_log_info("Download done, installing artifact");
     mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_INSTALLING);
-    if (MENDER_OK != (ret = mender_client_callbacks.ota_set_boot_partition(mender_client_ota_handle))) {
-        mender_log_error("Unable to set boot partition");
-        mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
-        goto END;
+    if (MENDER_OK != mender_storage_set_ota_deployment(id, artifact_name)) {
+        mender_log_error("Unable to save OTA ID, installing without it");
+        mender_storage_delete_ota_deployment();
     }
 
-    /* Save OTA ID to publish deployment status after rebooting */
-    if (MENDER_OK != (ret = mender_storage_set_ota_deployment(id, artifact_name))) {
-        mender_log_error("Unable to save OTA ID");
+    /* Set boot partition, which releases the handle when it succeeds */
+    if (MENDER_OK != (ret = mender_client_callbacks.ota_set_boot_partition(mender_client_ota_handle))) {
+        mender_log_error("Unable to set boot partition");
+        mender_client_callbacks.ota_abort(mender_client_ota_handle);
+        mender_client_ota_handle = NULL;
+        mender_storage_delete_ota_deployment();
         mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_FAILURE);
         goto END;
     }
+    mender_client_ota_handle = NULL;
 
     /* Now need to reboot to apply the update */
     mender_client_publish_deployment_status(id, MENDER_DEPLOYMENT_STATUS_REBOOTING);
